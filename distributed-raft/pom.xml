@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.study</groupId>
+        <artifactId>distributed</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>distributed-raft</artifactId>
+    <name>distributed-raft</name>
+    <description>Raft 共识算法 - 领导者选举、日志复制、安全性保证</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.study</groupId>
+            <artifactId>distributed-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.study</groupId>
+            <artifactId>distributed-rpc</artifactId>
+        </dependency>
+    </dependencies>
+</project>

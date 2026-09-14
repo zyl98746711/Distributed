@@ -1,0 +1,11 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: distributed-demo
+
+logging:
+  level:
+    com.study.distributed: INFO
+    com.study.distributed.raft: DEBUG
