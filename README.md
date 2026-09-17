@@ -19,6 +19,8 @@
   - [6. distributed-id - 分布式 ID](#6-distributed-id---分布式-id)
   - [7. distributed-ratelimit - 分布式限流](#7-distributed-ratelimit---分布式限流)
   - [8. distributed-demo - 演示应用](#8-distributed-demo---演示应用)
+  - [9. distributed-node - 独立节点进程](#9-distributed-node---独立节点进程)
+  - [10. distributed-manager - 节点管理服务](#10-distributed-manager---节点管理服务)
 - [快速开始](#快速开始)
 - [核心知识点索引](#核心知识点索引)
 
@@ -41,7 +43,9 @@ Distributed/
 │
 ├── distributed-raft/                # [共识] Raft 算法实现
 │   ├── core/                        #   RaftNode 核心状态机
-│   ├── log/                         #   日志存储
+│   ├── log/                         #   日志存储 (命令 + 两阶段配置日志)
+│   ├── membership/                  #   动态成员与双多数派
+│   ├── transport/                   #   真实 Socket Raft RPC
 │   ├── rpc/                         #   RequestVote / AppendEntries RPC
 │   ├── state/                       #   状态机接口
 │   └── config/                      #   配置
@@ -69,7 +73,16 @@ Distributed/
 │   ├── annotation/                  #   @RateLimit 注解
 │   └── aop/                         #   AOP 切面
 │
-└── distributed-demo/                # [演示] 整合所有模块
+├── distributed-node/                # [节点] 独立节点进程 (每进程一个 Raft 节点)
+│   ├── config/                      #   节点装配 (SocketRaftRpcService + RaftNode)
+│   └── controller/                  #   节点 HTTP 接口 (KV + Leader 转发 + 状态观测)
+│
+├── distributed-manager/             # [管理] 配置中心 + 本机进程编排 + 统一网关
+│   ├── cluster/                     #   进程生命周期与 Leader 发现
+│   ├── client/                      #   节点 HTTP 通信
+│   └── controller/                  #   动态扩缩容 /manager/nodes 与 /manager/kv
+│
+└── distributed-demo/                # [演示] 整合所有模块 (单 JVM 3 节点)
     ├── config/                      #   Spring 配置
     └── controller/                  #   演示 API
 ```
@@ -230,7 +243,8 @@ Map<String, Long> matchIndex;  // 每个 Follower 已匹配的最高日志索引
 | 文件 | 核心职责 |
 |------|---------|
 | `RaftNode` | **核心中的核心** - 选举、复制、安全性的完整实现 |
-| `LogEntry` | 日志条目 Record (term + index + command) |
+| `LogEntry` / `EntryType` | 日志条目 Record (term + index + type + command) |
+| `Membership` / `MemberCodec` | 不可变成员集、双多数派判断及配置日志编码 |
 | `LogStore` / `InMemoryLogStore` | 日志存储接口和内存实现 |
 | `RequestVoteRequest/Response` | 投票 RPC 消息 |
 | `AppendEntriesRequest/Response` | 日志复制/心跳 RPC 消息 |
@@ -373,6 +387,86 @@ GET /demo/ratelimit/compare # 四种算法对比
 
 ---
 
+### 9. distributed-node - 独立节点进程
+
+**把每个 Raft 节点放进独立 JVM 进程, 通过真实 TCP 通信 —— 这才是真正的"分布式"。**
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  进程 node-1  │     │  进程 node-2  │     │  进程 node-3  │
+│  ┌─────────┐ │     │  ┌─────────┐ │     │  ┌─────────┐ │
+│  │ RaftNode│ │     │  │ RaftNode│ │     │  │ RaftNode│ │
+│  │ KV 状态机 │ │     │  │ KV 状态机 │ │     │  │ KV 状态机 │ │
+│  │ Socket  │ │     │  │ Socket  │ │     │  │ Socket  │ │
+│  │ RPC     │ │     │  │ RPC     │ │     │  │ RPC     │ │
+│  └────┬────┘ │     │  └────┬────┘ │     │  └────┬────┘ │
+│  RPC :9001   │     │  RPC :9002   │     │  RPC :9003   │
+│  HTTP :8001  │     │  HTTP :8002  │     │  HTTP :8003  │
+└───────┼──────┘     └───────┼──────┘     └───────┼──────┘
+        └──────────────── TCP 真实网络 ────────────────┘
+```
+
+与 demo 模式 (单 JVM) 的对比:
+
+| 维度 | distributed-demo | distributed-node |
+|------|------------------|------------------|
+| 节点通信 | `InMemoryRaftRpcService` 直接方法调用 | `SocketRaftRpcService` 真实 TCP |
+| 进程隔离 | 无 (一个进程崩全崩) | 每节点独立 JVM, 可单独 kill |
+| 故障实验 | 无法模拟机器宕机 | kill / 重启节点, 观察重选与日志追赶 |
+| 客户端入口 | 集中式 /kv/{nodeId}/... | 推荐统一经 manager 的 /manager/kv 访问 |
+
+**关键文件**:
+
+| 文件 | 核心职责 |
+|------|---------|
+| `RaftProtocol` | 长度前缀帧 + 消息类型标签, 解决粘包 |
+| `SocketRaftRpcService` | 长连接 + requestId 匹配响应 + 超时自动重连 |
+| `NodeConfig` | 每进程装配 SocketRaftRpcService + RaftNode |
+| `NodeKVController` | 写请求自动转发到 Leader (`X-Raft-Forwarded` 防循环) |
+| `NodeController` | /node/status、/node/log 状态观测 |
+| `NodeMembershipController` | /raft/members 查询与成员变更 (非 Leader 返回 409) |
+
+---
+
+### 10. distributed-manager - 节点管理服务
+
+节点不再使用 node-1/2/3 profile；初始部署清单集中到 manager 的 `application.yml`。
+manager 用 `ProcessBuilder` 为每个节点注入独立 ID、HTTP/RPC 端口及 bootstrap 清单。
+
+```text
+其他服务 ── HTTP :7000 ──> manager（控制平面，不参与投票）
+                          ├─ 配置清单 / 本机进程启停
+                          └─ /manager/kv 自动发现并路由 Leader
+                                      │
+                     node-1 <── Raft TCP ──> node-2 <──> node-N
+                                数据平面 / 联合共识
+```
+
+| 组件 | 职责 |
+|------|------|
+| `ManagerProperties` | 节点 jar 路径、预置清单、auto-start |
+| `ManagedNode` / `NodeProcessManager` | 分离部署与成员状态，启动、探活、通过启动标识及进程创建时间核实 PID、停止进程 |
+| `LeaderLocator` | 每 2 秒探测 Leader；缓存失效时重新发现 |
+| `NodeHttpClient` | 有限连接/读取超时，严格编码 URI，防止无限等待 |
+| `ManagerController` | 集群状态、串行扩缩容、进程控制、KV 网关 |
+
+**Joint Consensus**：先追加 `CONFIG_JOINT(C_old,C_new)`，再在它提交后追加 `CONFIG_FINAL(C_new)`。
+联合期选举和日志提交要求旧、新配置各自的多数派；FINAL 追加后切换为新配置多数派。
+配置追加即用于选举，日志冲突截断后重建配置；新 Leader 的 no-op 日志用于推进旧任期日志与未完成变更。
+新增节点先以不包含自身的 bootstrap 启动，收到联合配置前不投票/参选；移除成员必须提交 FINAL 后才停止进程。
+
+**边界**：
+- 本地教学实现，仅支持 `127.0.0.1`/`localhost` 进程编排；manager 默认仅监听回环地址，没有鉴权，不能直接暴露公网。
+- 一次变更一个成员；拒绝并发变更及移除最后一个成员。4 节点需要 3 票，容错能力并不高于 3 节点。
+- 部署清单保存在 `logs/manager-nodes.json`，重启优先读取它；已移除 ID/端口保留，避免误复用。共识成员以 Leader 已提交配置为准。
+- 超时不代表变更失败，保留 PENDING 部署记录；后续扩缩容先向 Leader 对账。只对已确认成功但未追平的 ADD 尝试补偿 REMOVE。
+- manager 退出不自动停止节点，可重启接管；停机前可逐个调用 stop 接口。stop/start 只控制进程，不改变成员数。
+- manager 是单实例入口，不实现高可用或跨机 agent；节点 Raft 通信不经过 manager。
+- Raft 日志、任期、投票及 KV 仍在内存中。单节点重启可从存活多数派追赶，但不保证掉电安全；全体重启丢失 KV，不能作为生产存储。
+- 网关读路由至 Leader，但没有 ReadIndex/租约验证，**不是线性一致读**。网络超时的写入结果可能未知，不会盲目自动重试。
+
+---
+
 ## 快速开始
 
 ### 环境要求
@@ -393,7 +487,59 @@ cd distributed-demo
 mvn spring-boot:run
 ```
 
+### 独立进程集群模式 (真实分布式)
+
+从项目根目录执行以下命令 (Windows/Linux/macOS 通用)，manager 自动启动 3 个独立 JVM。
+默认 manager HTTP 7000，节点 HTTP 8001-8003，Raft TCP 9001-9003；原启动/停止脚本已由 manager 取代。
+
+```bash
+mvn clean package
+# 若 Windows 的 target 被占用，可改用 mvn package
+java -jar distributed-manager/target/distributed-manager-1.0.0-SNAPSHOT.jar
+```
+
+首次迁移时先停止旧版本节点，避免端口冲突。新 manager 不会接管无法核实身份的旧脚本进程。
+非项目根目录启动时使用 `--manager.node-jar=<绝对路径>`，日志和部署状态路径也可通过 manager 配置覆盖。
+`--manager.auto-start=false` 禁止自动拉起节点。节点日志追加写入 `logs/node-N.log`。
+
+集群就绪后，其他服务只需知道 `http://127.0.0.1:7000`：
+
+```bash
+# 状态与统一读写 (Windows PowerShell 可使用 curl.exe)
+curl http://127.0.0.1:7000/manager/cluster
+curl -X PUT "http://127.0.0.1:7000/manager/kv/name?value=raft"
+curl http://127.0.0.1:7000/manager/kv/name
+curl http://127.0.0.1:7000/manager/kv/all
+
+# 动态扩容：自动分配 node-N / HTTP / RPC 端口，也可传 JSON 指定 host/httpPort/rpcPort
+curl -X POST http://127.0.0.1:7000/manager/nodes
+# 新建集群首次扩容通常分配 node-4；以返回的 id 为准
+curl http://127.0.0.1:8004/raft/members
+curl -X DELETE http://127.0.0.1:7000/manager/nodes/node-4
+
+# 故障实验：将 node-1 替换为 /manager/cluster 显示的 Leader
+curl -X POST http://127.0.0.1:7000/manager/nodes/node-1/stop
+# 等待数秒重选后，网关无需改地址即可继续写入
+curl -X PUT "http://127.0.0.1:7000/manager/kv/still?value=alive"
+curl -X POST http://127.0.0.1:7000/manager/nodes/node-1/start
+
+# 节点接口保留用于观察配置日志与复制进度
+curl http://127.0.0.1:8001/node/log
+curl http://127.0.0.1:8001/raft/members
+```
+
 ### 测试
+
+```bash
+# 单元测试：多数派、日志冲突、动态成员、Leader 退役及配置变更中断恢复
+mvn test
+# 真实进程端到端测试：先打包 node，再启动独立端口的测试集群，结束自动停止
+mvn package "-Dcluster.e2e=true"
+```
+
+端到端测试覆盖统一网关、中文/特殊字符、三节点复制、动态扩缩容、重复启动保护、
+manager 重启接管以及 Leader 故障后的重选与日志追赶；日志位于 `distributed-manager/target/e2e/`。
+以下接口属于原有 demo 模式：
 
 ```bash
 # 查看集群状态 (观察 Leader 选举结果)
@@ -424,6 +570,7 @@ curl http://localhost:8080/demo/ratelimit/compare
 | 知识点 | 所在模块 | 关键文件 |
 |--------|---------|---------|
 | TCP 粘包/拆包 | rpc | `RpcProtocol` |
+| 长度前缀帧 (粘包解决) | raft | `RaftProtocol` |
 | 自定义二进制协议 | rpc | `RpcProtocol` |
 | JDK 动态代理 | rpc | `RpcProxyFactory` |
 | Virtual Threads | rpc, raft | `RpcServer`, `RpcClient` |
@@ -432,6 +579,14 @@ curl http://localhost:8080/demo/ratelimit/compare
 | 日志匹配 (安全性) | raft | `RaftNode.handleAppendEntries()` |
 | 投票限制 (安全性) | raft | `RaftNode.handleRequestVote()` |
 | 选举超时随机化 | raft | `RaftNode.randomElectionTimeout()` |
+| 心跳捎带日志 (落后节点追赶) | raft | `RaftNode.replicateTo()` |
+| Joint Consensus 与双多数派 | raft | `Membership`, `RaftNode.changeMembership()` |
+| 控制平面与数据平面 | manager, node | `ManagerController`, `NodeMembershipController` |
+| 本机进程编排与身份校验 | manager | `NodeProcessManager` |
+| Leader 发现与统一网关 | manager | `LeaderLocator`, `NodeHttpClient` |
+| 长连接 + requestId 匹配响应 | raft | `SocketRaftRpcService` |
+| 客户端可连任意节点 (写转发 Leader) | node | `NodeKVController` |
+| kill Leader 故障实验 | node | `distributed-node` |
 | 状态机确定性 | kv | `KVStateMachine` |
 | 锁的 TTL + 看门狗 | lock | `RaftDistributedLock` |
 | 可重入锁 | lock | `SimpleDistributedLock` |

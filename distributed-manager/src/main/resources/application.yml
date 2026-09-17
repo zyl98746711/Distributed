@@ -1,0 +1,20 @@
+server:
+  address: 127.0.0.1
+  port: 7000
+spring:
+  application:
+    name: distributed-manager
+manager:
+  node-jar: distributed-node/target/distributed-node-1.0.0-SNAPSHOT.jar
+  log-directory: logs
+  # 保存部署地址与操作状态，不替代 Raft 共识日志；首次启动才使用下方清单。
+  state-file: logs/manager-nodes.json
+  auto-start: true
+  cluster:
+    nodes:
+      - { id: node-1, host: 127.0.0.1, rpc-port: 9001, http-port: 8001 }
+      - { id: node-2, host: 127.0.0.1, rpc-port: 9002, http-port: 8002 }
+      - { id: node-3, host: 127.0.0.1, rpc-port: 9003, http-port: 8003 }
+logging:
+  level:
+    com.study.distributed: INFO

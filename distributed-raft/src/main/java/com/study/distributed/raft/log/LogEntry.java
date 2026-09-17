@@ -13,6 +13,15 @@ import java.io.Serializable;
 public record LogEntry(
         long term,
         long index,
+        EntryType type,
         byte[] command
 ) implements Serializable {
+    public LogEntry {
+        if (type == null) type = EntryType.COMMAND;
+    }
+
+    /** 兼容原有 demo/KV 构造方式；空命令用于新任期的 no-op。 */
+    public LogEntry(long term, long index, byte[] command) {
+        this(term, index, EntryType.COMMAND, command);
+    }
 }

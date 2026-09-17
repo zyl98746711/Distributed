@@ -5,6 +5,9 @@ import com.study.distributed.raft.config.RaftConfig;
 import com.study.distributed.raft.log.InMemoryLogStore;
 import com.study.distributed.raft.log.LogEntry;
 import com.study.distributed.raft.log.LogStore;
+import com.study.distributed.raft.log.EntryType;
+import com.study.distributed.raft.membership.MemberCodec;
+import com.study.distributed.raft.membership.Membership;
 import com.study.distributed.raft.rpc.*;
 import com.study.distributed.raft.state.StateMachine;
 import org.slf4j.Logger;
@@ -50,7 +53,15 @@ public class RaftNode {
 
     // ====== 配置与依赖 ======
     private final RaftConfig config;
-    private final List<NodeInfo> peers;
+    private final Membership bootstrapMembership;
+    private volatile Membership activeMembership;
+    private volatile Membership committedMembership;
+    private long configIndex;
+    private long jointIndex;
+    private long finalIndex;
+    private final Map<Long, CompletableFuture<Object>> pendingCommits = new HashMap<>();
+    private CompletableFuture<Membership> pendingMembership;
+    private final Set<String> replicating = ConcurrentHashMap.newKeySet();
     private final StateMachine stateMachine;
     private final RaftRpcService rpcService;
 
@@ -60,11 +71,13 @@ public class RaftNode {
     private final AtomicBoolean running = new AtomicBoolean(true);
 
     // 选举投票计数
-    private volatile int votesReceived = 0;
+    private final Set<String> grantedVoters = new HashSet<>();
 
     public RaftNode(RaftConfig config, List<NodeInfo> peers, StateMachine stateMachine, RaftRpcService rpcService) {
         this.config = config;
-        this.peers = peers;
+        this.bootstrapMembership = Membership.single(peers);
+        this.activeMembership = bootstrapMembership;
+        this.committedMembership = bootstrapMembership;
         this.stateMachine = stateMachine;
         this.rpcService = rpcService;
         this.logStore = new InMemoryLogStore();
@@ -74,7 +87,7 @@ public class RaftNode {
      * 启动 Raft 节点
      */
     public void start() {
-        log.info("[{}] Raft 节点启动, peers={}", config.nodeId(), peers.size());
+        log.info("[{}] Raft 节点启动, peers={}", config.nodeId(), activeMembership.allNodes().size());
 
         // 选举超时检查线程
         Thread.ofVirtual().name("raft-election-" + config.nodeId()).start(() -> {
@@ -122,7 +135,8 @@ public class RaftNode {
      *   随机化是关键! 如果所有节点超时时间相同，会同时发起选举，
      *   导致票数分裂，无人当选。随机化让某个节点先超时，大概率赢得选举。
      */
-    private void checkElectionTimeout() {
+    private synchronized void checkElectionTimeout() {
+        if (!running.get() || !activeMembership.contains(config.nodeId())) return;
         if (role == NodeRole.LEADER) return; // Leader 不需要检查超时
 
         long elapsed = System.currentTimeMillis() - lastHeartbeatTime;
@@ -165,38 +179,30 @@ public class RaftNode {
      *   7. 如果超时未获得多数票 → 等待下一轮选举
      */
     private synchronized void startElection() {
+        if (!running.get() || !activeMembership.contains(config.nodeId())) return;
         // 变为 Candidate
         role = NodeRole.CANDIDATE;
         currentTerm++;
         votedFor = config.nodeId();
-        votesReceived = 1; // 投给自己
+        grantedVoters.clear();
+        grantedVoters.add(config.nodeId());
         lastHeartbeatTime = System.currentTimeMillis();
 
         log.info("[{}] 成为 Candidate, term={}", config.nodeId(), currentTerm);
 
         // 检查是否已经获得多数票 (单节点集群)
-        if (peers.size() <= 1) {
+        if (activeMembership.hasQuorum(grantedVoters)) {
             becomeLeader();
             return;
         }
 
         // 并行向所有 peer 发送 RequestVote
-        CountDownLatch latch = new CountDownLatch(peers.size());
-
-        for (NodeInfo peer : peers) {
-            if (peer.id().equals(config.nodeId())) {
-                latch.countDown();
-                continue;
-            }
-
+        RequestVoteRequest request = new RequestVoteRequest(currentTerm, config.nodeId(),
+                logStore.lastIndex(), logStore.lastTerm());
+        for (NodeInfo peer : activeMembership.allNodes()) {
+            if (peer.id().equals(config.nodeId())) continue;
             Thread.ofVirtual().start(() -> {
                 try {
-                    RequestVoteRequest request = new RequestVoteRequest(
-                            currentTerm,
-                            config.nodeId(),
-                            logStore.lastIndex(),
-                            logStore.lastTerm()
-                    );
 
                     RequestVoteResponse response = rpcService.requestVote(peer, request);
 
@@ -204,24 +210,19 @@ public class RaftNode {
                         if (response.term() > currentTerm) {
                             // 发现更高任期，退回 Follower
                             stepDown(response.term());
-                            latch.countDown();
                             return;
                         }
 
-                        if (role == NodeRole.CANDIDATE && response.term() == currentTerm && response.voteGranted()) {
-                            votesReceived++;
-                            log.info("[{}] 收到投票 from {}, votes={}/{}", config.nodeId(), peer.id(),
-                                    votesReceived, majorityCount());
-
-                            if (votesReceived >= majorityCount()) {
+                        if (running.get() && role == NodeRole.CANDIDATE && request.term() == currentTerm
+                                && response.term() == currentTerm && response.voteGranted()) {
+                            grantedVoters.add(peer.id());
+                            if (activeMembership.hasQuorum(grantedVoters)) {
                                 becomeLeader();
                             }
                         }
                     }
                 } catch (Exception e) {
                     log.debug("[{}] RequestVote 失败 -> {}: {}", config.nodeId(), peer.id(), e.getMessage());
-                } finally {
-                    latch.countDown();
                 }
             });
         }
@@ -243,6 +244,10 @@ public class RaftNode {
      *   说明候选人的日志不够完整，不能成为 Leader (否则已提交的数据可能丢失)。
      */
     public synchronized RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
+        if (!running.get() || !activeMembership.contains(config.nodeId())
+                || !activeMembership.contains(request.candidateId())) {
+            return new RequestVoteResponse(currentTerm, false);
+        }
         // 如果对方任期更高，更新自己
         if (request.term() > currentTerm) {
             stepDown(request.term());
@@ -296,13 +301,19 @@ public class RaftNode {
         log.info("[{}] 成为 Leader! term={}", config.nodeId(), currentTerm);
 
         // 初始化 Leader 的 nextIndex 和 matchIndex
-        for (NodeInfo peer : peers) {
+        nextIndex.clear();
+        matchIndex.clear();
+        for (NodeInfo peer : replicationTargets()) {
             if (!peer.id().equals(config.nodeId())) {
                 nextIndex.put(peer.id(), logStore.lastIndex() + 1);
                 matchIndex.put(peer.id(), 0L);
             }
         }
 
+        // 新任期空命令使旧任期日志可被间接提交，也能接续中断的配置变更。
+        logStore.append(new LogEntry(currentTerm, logStore.lastIndex() + 1, null));
+        proposeFinalIfNeeded();
+        tryAdvanceCommitIndex();
         // 立即发送心跳，确立权威
         sendHeartbeats();
     }
@@ -324,7 +335,7 @@ public class RaftNode {
      * 注意: 这里返回的 Future 在多数派复制完成后完成，不保证状态机已应用
      */
     public synchronized CompletableFuture<Object> submitCommand(byte[] command) {
-        if (role != NodeRole.LEADER) {
+        if (!running.get() || role != NodeRole.LEADER) {
             return CompletableFuture.failedFuture(
                     new NotLeaderException(leaderId));
         }
@@ -334,45 +345,35 @@ public class RaftNode {
         logStore.append(entry);
         log.debug("[{}] 追加日志 index={}, term={}", config.nodeId(), entry.index(), entry.term());
 
-        // 如果是单节点集群，直接提交
-        if (peers.size() <= 1) {
-            commitIndex = entry.index();
-            applyCommittedEntries();
-            return CompletableFuture.completedFuture(null);
-        }
-
-        // 异步复制给 Follower
+        // 单节点和多节点统一按确认索引推进，失败的 RPC 不计入多数派。
         CompletableFuture<Object> future = new CompletableFuture<>();
-        replicateToFollowers(entry, future);
+        pendingCommits.put(entry.index(), future);
+        tryAdvanceCommitIndex();
+        sendHeartbeats();
         return future;
     }
 
     /**
      * 将新日志复制给所有 Follower
      */
-    private void replicateToFollowers(LogEntry entry, CompletableFuture<Object> future) {
-        int replicationCount = 1; // 包含 Leader 自己
-        final int[] count = {replicationCount};
-
-        for (NodeInfo peer : peers) {
-            if (peer.id().equals(config.nodeId())) continue;
-
-            Thread.ofVirtual().start(() -> {
-                try {
-                    sendAppendEntries(peer, List.of(entry));
-                    synchronized (this) {
-                        count[0]++;
-                        if (count[0] >= majorityCount()) {
-                            // 多数派已复制，可以提交
-                            commitIndex = entry.index();
-                            applyCommittedEntries();
-                            future.complete(null);
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("[{}] 复制日志到 {} 失败: {}", config.nodeId(), peer.id(), e.getMessage());
-                }
-            });
+    private void tryAdvanceCommitIndex() {
+        if (!running.get() || role != NodeRole.LEADER) return;
+        // FINAL 只能在 JOINT 提交后追加，届时按新配置计票；否则缩容后旧成员
+        // 退出且 Leader 故障时，新 Leader 会因仍等待旧多数派而无法继续提交。
+        Membership quorum = activeMembership;
+        for (long index = logStore.lastIndex(); index > commitIndex; index--) {
+            if (logStore.get(index).term() != currentTerm) continue;
+            Set<String> acknowledged = new HashSet<>();
+            acknowledged.add(config.nodeId());
+            for (NodeInfo peer : quorum.allNodes()) {
+                if (matchIndex.getOrDefault(peer.id(), 0L) >= index) acknowledged.add(peer.id());
+            }
+            if (quorum.hasQuorum(acknowledged)) {
+                commitIndex = index;
+                applyCommittedEntries();
+                proposeFinalIfNeeded();
+                break;
+            }
         }
     }
 
@@ -388,33 +389,43 @@ public class RaftNode {
      *   → Follower 用它来检查自己的日志是否和 Leader 一致
      *   → 如果不一致，返回 success=false，Leader 回退 nextIndex 重试
      */
-    private void sendHeartbeats() {
-        for (NodeInfo peer : peers) {
-            if (peer.id().equals(config.nodeId())) continue;
-            Thread.ofVirtual().start(() -> sendAppendEntries(peer, List.of()));
+    private synchronized void sendHeartbeats() {
+        if (!running.get() || role != NodeRole.LEADER) return;
+        for (NodeInfo peer : replicationTargets()) {
+            if (peer.id().equals(config.nodeId()) || !replicating.add(peer.id())) continue;
+            Thread.ofVirtual().start(() -> {
+                try { replicateTo(peer); }
+                finally { replicating.remove(peer.id()); }
+            });
         }
     }
 
-    private void sendAppendEntries(NodeInfo peer, List<LogEntry> entries) {
-        long nextIdx = nextIndex.getOrDefault(peer.id(), 1L);
-        long prevLogIndex = nextIdx - 1;
-        long prevLogTerm = 0;
+    private List<NodeInfo> replicationTargets() {
+        Map<String, NodeInfo> targets = new LinkedHashMap<>();
+        committedMembership.allNodes().forEach(n -> targets.put(n.id(), n));
+        activeMembership.allNodes().forEach(n -> targets.put(n.id(), n));
+        return List.copyOf(targets.values());
+    }
 
-        if (prevLogIndex > 0) {
-            LogEntry prevEntry = logStore.get(prevLogIndex);
-            if (prevEntry != null) {
-                prevLogTerm = prevEntry.term();
-            }
+    /**
+     * 发送心跳, 必要时捎带缺失日志
+     *
+     * AppendEntries 兼任两个职责: 维持 Leader 权威 (心跳) + 复制日志。
+     * 若 follower 的 nextIndex 落后 (例如节点重启后日志为空),
+     * 仅等待"新写入触发复制"无法追平, 必须在心跳中补发历史日志:
+     *   - nextIndex <= lastIndex: 携带 [nextIndex, lastIndex] 区间的日志
+     *   - 否则: 发送纯心跳 (entries 为空)
+     */
+    private void replicateTo(NodeInfo peer) {
+        AppendEntriesRequest request;
+        synchronized (this) {
+            if (!running.get() || role != NodeRole.LEADER) return;
+            long next = Math.min(nextIndex.getOrDefault(peer.id(), 1L), logStore.lastIndex() + 1);
+            long previous = next - 1;
+            long term = previous == 0 ? 0 : logStore.get(previous).term();
+            request = new AppendEntriesRequest(currentTerm, config.nodeId(), previous, term,
+                    logStore.getRange(next, logStore.lastIndex()), commitIndex);
         }
-
-        AppendEntriesRequest request = new AppendEntriesRequest(
-                currentTerm,
-                config.nodeId(),
-                prevLogIndex,
-                prevLogTerm,
-                entries,
-                commitIndex
-        );
 
         try {
             AppendEntriesResponse response = rpcService.appendEntries(peer, request);
@@ -425,16 +436,16 @@ public class RaftNode {
                     return;
                 }
 
+                if (!running.get() || role != NodeRole.LEADER || request.term() != currentTerm) return;
                 if (response.success()) {
-                    // 更新 nextIndex 和 matchIndex
-                    if (!entries.isEmpty()) {
-                        long lastSentIndex = entries.getLast().index();
-                        nextIndex.put(peer.id(), lastSentIndex + 1);
-                        matchIndex.put(peer.id(), lastSentIndex);
-                    }
+                    long matched = request.entries().isEmpty() ? request.prevLogIndex()
+                            : request.entries().getLast().index();
+                    nextIndex.put(peer.id(), matched + 1);
+                    matchIndex.put(peer.id(), matched);
+                    tryAdvanceCommitIndex();
                 } else {
-                    // 日志不匹配，回退 nextIndex 重试
-                    nextIndex.merge(peer.id(), 1L, (k, v) -> Math.max(1, v - 1));
+                    nextIndex.put(peer.id(), Math.max(1, request.prevLogIndex()));
+                    matchIndex.put(peer.id(), 0L);
                 }
             }
         } catch (Exception e) {
@@ -473,13 +484,13 @@ public class RaftNode {
      */
     public synchronized AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
         // 如果 Leader 任期比自己低，拒绝
-        if (request.term() < currentTerm) {
+        if (!running.get() || request.term() < currentTerm) {
             return new AppendEntriesResponse(currentTerm, false, config.nodeId(), lastApplied);
         }
 
         // 认可 Leader
         if (request.term() >= currentTerm) {
-            if (request.term() > currentTerm) {
+            if (request.term() > currentTerm || role != NodeRole.FOLLOWER) {
                 stepDown(request.term());
             }
             role = NodeRole.FOLLOWER;
@@ -504,8 +515,11 @@ public class RaftNode {
                 LogEntry existing = logStore.get(entry.index());
                 if (existing != null && existing.term() != entry.term()) {
                     // 冲突: 删除从这里开始的所有日志
+                    if (entry.index() <= commitIndex) {
+                        throw new IllegalStateException("不能截断已提交日志");
+                    }
                     logStore.truncateFrom(entry.index());
-                    break;
+                    existing = null;
                 }
                 if (existing == null) {
                     logStore.append(entry);
@@ -513,9 +527,11 @@ public class RaftNode {
             }
         }
 
+        refreshMembership();
         // 更新 commitIndex
         if (request.leaderCommit() > commitIndex) {
-            commitIndex = Math.min(request.leaderCommit(), logStore.lastIndex());
+            long matchedThrough = request.prevLogIndex() + request.entries().size();
+            commitIndex = Math.max(commitIndex, Math.min(request.leaderCommit(), matchedThrough));
             applyCommittedEntries();
         }
 
@@ -531,16 +547,121 @@ public class RaftNode {
      */
     private void applyCommittedEntries() {
         while (lastApplied < commitIndex) {
-            lastApplied++;
-            LogEntry entry = logStore.get(lastApplied);
-            if (entry != null && entry.command() != null) {
-                try {
-                    Object result = stateMachine.apply(entry.command());
-                    log.debug("[{}] 应用日志 index={}, result={}", config.nodeId(), lastApplied, result);
-                } catch (Exception e) {
-                    log.error("[{}] 应用状态机异常 index={}: {}", config.nodeId(), lastApplied, e.getMessage());
+            LogEntry entry = logStore.get(lastApplied + 1);
+            CompletableFuture<Object> pending = pendingCommits.remove(entry.index());
+            try {
+                Object result = null;
+                if (entry.type() == EntryType.COMMAND) {
+                    if (entry.command() != null) result = stateMachine.apply(entry.command());
+                } else {
+                    committedMembership = MemberCodec.decode(entry.command());
+                    log.info("[{}] 应用配置 index={}, type={}, members={}", config.nodeId(),
+                            entry.index(), entry.type(), committedMembership);
+                    if (entry.type() == EntryType.CONFIG_FINAL && pendingMembership != null) {
+                        pendingMembership.complete(committedMembership);
+                        pendingMembership = null;
+                    }
                 }
+                lastApplied = entry.index();
+                if (pending != null) pending.complete(result);
+            } catch (Exception e) {
+                if (pending != null) pending.completeExceptionally(e);
+                running.set(false);
+                failPending(e);
+                throw new IllegalStateException("状态机应用失败，停止节点以免跳过日志", e);
             }
+        }
+        if (role == NodeRole.LEADER && !committedMembership.contains(config.nodeId())) {
+            // 退役前尽力将 FINAL 提交点告知新配置节点；失败可由新 Leader 的 no-op 接续。
+            for (NodeInfo peer : committedMembership.allNodes()) {
+                long last = logStore.lastIndex();
+                AppendEntriesRequest notice = new AppendEntriesRequest(currentTerm, config.nodeId(),
+                        last, logStore.lastTerm(), List.of(), commitIndex);
+                Thread.ofVirtual().start(() -> {
+                    try { rpcService.appendEntries(peer, notice); }
+                    catch (Exception e) { log.debug("退役通知失败: {}", peer.id()); }
+                });
+            }
+            stepDown(currentTerm);
+        }
+    }
+
+    /**
+     * 配置追加即参与选举，不能延迟至 apply 后才约束多数派。
+     * 日志被截断时从 bootstrap 重放配置，恢复到最后一个仍存在的配置。
+     * 本项目日志/任期仍在内存中，不提供生产级掉电恢复保证。
+     */
+    private void refreshMembership() {
+        Membership latest = bootstrapMembership;
+        configIndex = jointIndex = finalIndex = 0;
+        for (LogEntry entry : logStore.getRange(1, logStore.lastIndex())) {
+            if (entry.type() == EntryType.COMMAND) continue;
+            latest = MemberCodec.decode(entry.command());
+            configIndex = entry.index();
+            if (entry.type() == EntryType.CONFIG_JOINT) jointIndex = entry.index();
+            else finalIndex = entry.index();
+        }
+        activeMembership = latest;
+    }
+
+    /** 一次只变更一个成员；返回值在 FINAL 应用后完成。 */
+    public synchronized CompletableFuture<Membership> changeMembership(boolean add, NodeInfo member) {
+        if (!running.get() || role != NodeRole.LEADER) {
+            return CompletableFuture.failedFuture(new NotLeaderException(leaderId));
+        }
+        if (activeMembership.isJoint() || configIndex > commitIndex || pendingMembership != null) {
+            return CompletableFuture.failedFuture(new IllegalStateException("已有成员变更在途，请等待完成"));
+        }
+        if (commitIndex == 0 || logStore.get(commitIndex).term() != currentTerm) {
+            return CompletableFuture.failedFuture(new IllegalStateException("新 Leader 尚未确认本任期提交点"));
+        }
+        List<NodeInfo> updated = new ArrayList<>(activeMembership.members());
+        if (add) {
+            if (activeMembership.contains(member.id())) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException("节点已存在: " + member.id()));
+            }
+            updated.add(member);
+        } else {
+            if (!updated.removeIf(n -> n.id().equals(member.id()))) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException("节点不存在: " + member.id()));
+            }
+            if (updated.isEmpty()) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException("不能移除最后一个成员"));
+            }
+        }
+        Membership joint = Membership.joint(activeMembership.members(), updated);
+        CompletableFuture<Membership> future = new CompletableFuture<>();
+        pendingMembership = future;
+        logStore.append(new LogEntry(currentTerm, logStore.lastIndex() + 1,
+                EntryType.CONFIG_JOINT, MemberCodec.encode(joint)));
+        refreshMembership();
+        for (NodeInfo peer : joint.allNodes()) {
+            nextIndex.putIfAbsent(peer.id(), 1L);
+            matchIndex.putIfAbsent(peer.id(), 0L);
+        }
+        tryAdvanceCommitIndex();
+        sendHeartbeats();
+        return future;
+    }
+
+    /** 已提交联合配置后才可追加 FINAL，Leader 更换后也可继续此步骤。 */
+    private void proposeFinalIfNeeded() {
+        if (role != NodeRole.LEADER || !activeMembership.isJoint() || jointIndex > commitIndex
+                || finalIndex > jointIndex) return;
+        Membership next = Membership.single(activeMembership.members());
+        logStore.append(new LogEntry(currentTerm, logStore.lastIndex() + 1,
+                EntryType.CONFIG_FINAL, MemberCodec.encode(next)));
+        refreshMembership();
+        tryAdvanceCommitIndex();
+        sendHeartbeats();
+    }
+
+    private void failPending(Throwable cause) {
+        pendingCommits.values().forEach(f -> f.completeExceptionally(cause));
+        pendingCommits.clear();
+        if (pendingMembership != null) {
+            pendingMembership.completeExceptionally(cause);
+            pendingMembership = null;
         }
     }
 
@@ -553,20 +674,27 @@ public class RaftNode {
      */
     private void stepDown(long newTerm) {
         log.info("[{}] 任期更新 {} -> {}, 退回 Follower", config.nodeId(), currentTerm, newTerm);
+        if (newTerm > currentTerm) votedFor = null;
         currentTerm = newTerm;
         role = NodeRole.FOLLOWER;
-        votedFor = null;
+        leaderId = null;
+        lastHeartbeatTime = System.currentTimeMillis();
+        failPending(new IllegalStateException("领导权已变更，已追加操作的结果未知，请查询确认"));
     }
 
     /**
      * 多数派数量
      */
-    private int majorityCount() {
-        return peers.size() / 2 + 1;
+    public Membership getMembership() { return activeMembership; }
+    public Membership getCommittedMembership() { return committedMembership; }
+    public synchronized boolean isMembershipChanging() {
+        return activeMembership.isJoint() || configIndex > commitIndex;
     }
 
-    public void stop() {
+    public synchronized void stop() {
         running.set(false);
+        role = NodeRole.FOLLOWER;
+        failPending(new IllegalStateException("节点已停止"));
     }
 
     // ====== Getters ======

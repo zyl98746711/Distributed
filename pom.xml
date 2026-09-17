@@ -26,6 +26,8 @@
         <module>distributed-lock</module>
         <module>distributed-id</module>
         <module>distributed-ratelimit</module>
+        <module>distributed-node</module>
+        <module>distributed-manager</module>
         <module>distributed-demo</module>
     </modules>
 

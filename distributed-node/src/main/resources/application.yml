@@ -1,0 +1,25 @@
+# 独立 Raft 节点进程 - 默认配置 (node-1)
+# manager 通过命令行覆盖节点 ID、端口与 bootstrap 成员列表
+spring:
+  application:
+    name: distributed-node
+
+server:
+  port: 8001
+
+raft:
+  node-id: node-1
+  host: 127.0.0.1
+  rpc-port: 9001
+  # 集群节点列表: id@host:rpcPort:httpPort
+  peers: node-1@127.0.0.1:9001:8001
+  # 选举超时随机范围, 心跳间隔 (毫秒)
+  election-timeout-min: 2000
+  election-timeout-max: 3000
+  heartbeat-interval: 500
+
+logging:
+  level:
+    com.study.distributed: INFO
+    com.study.distributed.raft: DEBUG
+
