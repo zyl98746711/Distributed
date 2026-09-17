@@ -31,6 +31,22 @@ class ManagerEndToEndTest {
             }
         }
     }
+    /** 与进程管理器使用相同的独占绑定检查，等待系统释放停止节点的端口。 */
+    private void awaitPortsReleased(int... nodePorts) throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(90).toNanos();
+        while (System.nanoTime() < deadline) {
+            boolean available = true;
+            for (int nodePort : nodePorts) {
+                try (ServerSocket socket = new ServerSocket()) {
+                    socket.setReuseAddress(false);
+                    socket.bind(new InetSocketAddress("127.0.0.1", nodePort));
+                } catch (BindException e) { available = false; }
+            }
+            if (available) return;
+            Thread.sleep(200);
+        }
+        fail("停止节点的端口未在限定时间内释放");
+    }
     private void start(String[] args) {
         context = new SpringApplicationBuilder(ManagerApplication.class).run(args);
         port = ((ServletWebServerApplicationContext) context).getWebServer().getPort();
@@ -85,6 +101,14 @@ class ManagerEndToEndTest {
         try {
             start(args);
             registry = context.getBean(NodeProcessManager.class);
+            for (String resource : List.of("/", "/styles.css", "/app.js")) {
+                var page = http.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + resource))
+                        .timeout(Duration.ofSeconds(3)).GET().build(), HttpResponse.BodyHandlers.ofString());
+                assertEquals(200, page.statusCode());
+                assertFalse(page.body().isBlank());
+                if ("/".equals(resource)) assertTrue(page.body().contains("集群总览"));
+            }
+            call("GET", "/manager/nodes/node-999/log", null, 404);
             await(() -> !leader().isEmpty());
             assertEquals(3, cluster().path("nodes").size());
             String value = "中文 + & # / =";
@@ -92,10 +116,20 @@ class ManagerEndToEndTest {
             assertEquals(value, call("GET", "/manager/kv/name", null, 200).path("value").asText());
             await(() -> {
                 try {
-                    for (int p : httpPorts) if (!value.equals(direct(p, "/kv/name").path("value").asText())) return false;
+                    for (int i = 0; i < httpPorts.length; i++) {
+                        if (!value.equals(direct(httpPorts[i], "/kv/name").path("value").asText())) return false;
+                        if (!value.equals(call("GET", "/manager/nodes/node-" + (i + 1) + "/kv", null, 200).path("name").asText())) return false;
+                    }
                     return true;
                 } catch (Exception e) { return false; }
             });
+            for (int i = 1; i <= 3; i++) {
+                String base = "/manager/nodes/node-" + i;
+                JsonNode observedLog = call("GET", base + "/log", null, 200);
+                assertEquals("node-" + i, observedLog.path("nodeId").asText());
+                assertFalse(observedLog.path("entries").isEmpty());
+                assertEquals(3, call("GET", base + "/members", null, 200).path("committedMembers").size());
+            }
             long pid = direct(httpPorts[0], "/node/status").path("pid").asLong();
             call("POST", "/manager/nodes/node-1/start", null, 200);
             assertEquals(pid, direct(httpPorts[0], "/node/status").path("pid").asLong());
@@ -126,11 +160,15 @@ class ManagerEndToEndTest {
                 catch (Exception e) { return false; }
             });
             String former = leader();
+            int restartedPort = httpPorts[Integer.parseInt(former.substring(5)) - 1];
+            int restartedRpcPort = direct(restartedPort, "/node/status").path("rpcPort").asInt();
             call("POST", "/manager/nodes/" + former + "/stop", null, 200);
+            call("GET", "/manager/nodes/" + former + "/log", null, 502);
+            call("GET", "/manager/nodes/" + former + "/kv", null, 502);
             await(() -> { String current = leader(); return !current.isEmpty() && !current.equals(former); });
             call("PUT", "/manager/kv/failover?value=ok", null, 200);
+            awaitPortsReleased(restartedPort, restartedRpcPort);
             call("POST", "/manager/nodes/" + former + "/start", null, 200);
-            int restartedPort = httpPorts[Integer.parseInt(former.substring(5)) - 1];
             await(() -> {
                 try { return "ok".equals(direct(restartedPort, "/kv/failover").path("value").asText()); }
                 catch (Exception e) { return false; }

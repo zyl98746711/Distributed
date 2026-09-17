@@ -28,6 +28,28 @@ public class ManagerController {
     @GetMapping("/cluster")
     public Result<Map<String, Object>> cluster() { return Result.ok(leaders.cluster()); }
 
+    @GetMapping("/nodes/{id}/log")
+    public ResponseEntity<Result<?>> nodeLog(@PathVariable String id) {
+        return observe(id, NodeHttpClient.NodeView.LOG);
+    }
+    @GetMapping("/nodes/{id}/kv")
+    public ResponseEntity<Result<?>> nodeKv(@PathVariable String id) {
+        return observe(id, NodeHttpClient.NodeView.KV);
+    }
+    @GetMapping("/nodes/{id}/members")
+    public ResponseEntity<Result<?>> nodeMembers(@PathVariable String id) {
+        return observe(id, NodeHttpClient.NodeView.MEMBERS);
+    }
+    private ResponseEntity<Result<?>> observe(String id, NodeHttpClient.NodeView view) {
+        // 注册表校验在通信异常处理之外，未知节点保持 404 语义。
+        NodeDefinition node = processes.require(id).definition();
+        try {
+            return response(http.observe(node, view));
+        } catch (Exception e) {
+            return response(Result.fail(502, "无法读取节点 " + id + "，请确认节点在线后刷新"));
+        }
+    }
+
     public record AddNode(String host, Integer httpPort, Integer rpcPort) {}
 
     @PostMapping("/nodes")

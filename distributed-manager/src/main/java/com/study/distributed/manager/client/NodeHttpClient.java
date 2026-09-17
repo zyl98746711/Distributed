@@ -35,6 +35,15 @@ public class NodeHttpClient {
         }
         return result.data();
     }
+    /** 只读观测白名单，不允许浏览器传入任意转发地址。 */
+    public enum NodeView {
+        LOG("/node/log"), KV("/kv/all"), MEMBERS("/raft/members");
+        private final String path;
+        NodeView(String path) { this.path = path; }
+    }
+    public Result<JsonNode> observe(NodeDefinition node, NodeView view) {
+        return execute(client, HttpMethod.GET, uri(node, view.path), null);
+    }
     public JsonNode members(NodeDefinition node) {
         Result<JsonNode> result = execute(client, HttpMethod.GET, uri(node, "/raft/members"), null);
         if (result.code() != 200 || result.data() == null) throw new IllegalStateException("成员查询失败");
